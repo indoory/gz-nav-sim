@@ -26,7 +26,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 ROOT=$PWD
-WEB_ROOT="$ROOT/indoors-web"
+WEB_ROOT="${INDOORS_WEB_ROOT:-}"
+if [[ -z $WEB_ROOT ]]; then
+    if [[ -d "$ROOT/indoors-web" ]]; then
+        WEB_ROOT="$ROOT/indoors-web"
+    elif [[ -d "$ROOT/../indoors-web" ]]; then
+        WEB_ROOT="$(cd "$ROOT/../indoors-web" && pwd)"
+    else
+        WEB_ROOT="$ROOT/indoors-web"
+    fi
+fi
+export GZ_NAV_SIM_ROOT="$ROOT"
 
 # ── 옵션 파싱 ──────────────────────────────────────────────────────────
 WANT_FRONTEND=1
@@ -108,7 +118,20 @@ if [[ ! -d $WEB_ROOT ]]; then
 fi
 
 if [[ $WANT_BACKEND == 1 ]]; then
-    [[ -d /opt/corretto17 ]] || { echo "[err] /opt/corretto17 없음 — README §사전준비 4 참고"; exit 1; }
+    if [[ -d /opt/corretto17 ]]; then
+        export JAVA_HOME=/opt/corretto17
+    else
+        JAVA17_HOME=$(ls -d /usr/lib/jvm/java-17-openjdk-* 2>/dev/null | head -1 || true)
+        if [[ -z $JAVA17_HOME ]]; then
+            echo "[boot] Java 17 필요 — openjdk-17-jdk-headless 설치..."
+            apt-get update >/dev/null 2>&1
+            apt-get install -y openjdk-17-jdk-headless >/dev/null 2>&1
+            JAVA17_HOME=$(ls -d /usr/lib/jvm/java-17-openjdk-* 2>/dev/null | head -1 || true)
+        fi
+        [[ -n $JAVA17_HOME ]] || { echo "[err] Java 17 설치/탐지 실패"; exit 1; }
+        export JAVA_HOME="$JAVA17_HOME"
+    fi
+    export PATH="$JAVA_HOME/bin:$PATH"
 fi
 
 # ── 출력 디렉터리 ─────────────────────────────────────────────────────
@@ -166,17 +189,27 @@ purge_stale() {
     return 0
 }
 
+active_stale_pids() {
+    pgrep -f '/opt/ros/humble/lib/|gzserver|rtabmap|uvicorn|vite|java.*indoor' 2>/dev/null \
+        | while read -r pid; do
+            stat=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')
+            [[ -n $stat && $stat != Z* ]] && echo "$pid"
+          done
+}
+
 echo "[boot] killing stale ROS/Gazebo if any..."
 set +e   # 검증 블록 동안 pipefail / pgrep 0건 회피
 purge_stale
-remaining=$(pgrep -f '/opt/ros/humble/lib/|gzserver|rtabmap|uvicorn|vite|java.*indoor' 2>/dev/null | wc -l)
+remaining=$(active_stale_pids | wc -l)
 if [[ $remaining -gt 0 ]]; then
     echo "[warn] $remaining stale processes still alive after purge — running second pass"
     purge_stale
-    remaining=$(pgrep -f '/opt/ros/humble/lib/|gzserver|rtabmap|uvicorn|vite|java.*indoor' 2>/dev/null | wc -l)
+    remaining=$(active_stale_pids | wc -l)
     if [[ $remaining -gt 0 ]]; then
         echo "[err] $remaining stubborn processes — listing for manual review:"
-        pgrep -fa '/opt/ros/humble/lib/|gzserver|rtabmap|uvicorn|vite|java.*indoor' 2>/dev/null | head -10
+        active_stale_pids | head -10 | while read -r pid; do
+            ps -p "$pid" -o pid=,stat=,cmd= 2>/dev/null
+        done
     fi
 fi
 set -e

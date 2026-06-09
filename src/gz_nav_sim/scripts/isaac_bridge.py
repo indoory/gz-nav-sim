@@ -130,6 +130,9 @@ class IsaacBridge(Node):
         self.declare_parameter('scan_angle_max', 3.14159)
         self.declare_parameter('scan_range_min', 0.20)
         self.declare_parameter('scan_range_max', 12.0)
+        # Isaac currently reports useful base_pose deltas while base_twist may
+        # stay near zero. Use pose deltas for odom so Nav2 sees actual motion.
+        self.declare_parameter('odom_from_pose_delta', True)
 
         g = lambda n: self.get_parameter(n).value
         self._host = str(g('host'))
@@ -156,6 +159,7 @@ class IsaacBridge(Node):
         self._scan_range_min = float(g('scan_range_min'))
         self._scan_range_max = float(g('scan_range_max'))
         self._depth_scale = float(g('depth_scale_m'))
+        self._odom_from_pose_delta = bool(g('odom_from_pose_delta'))
 
         # Pre-build CameraInfo templates — only stamp/frame change per frame.
         self._rgb_info_tmpl = self._build_camera_info(
@@ -236,16 +240,15 @@ class IsaacBridge(Node):
         self._stop = threading.Event()
         self._seen_topics: set[str] = set()
 
-        # ── sim-honest odom integrator ──────────────────────────────────
-        # Real wheel odometry doesn't see world ground truth — we mimic that
-        # by ignoring sim's `base_pose` and integrating only the body-frame
-        # velocity (derived from `base_twist` rotated by current world yaw).
-        # /odom starts at (0,0,0); it drifts naturally from sampling/quant
-        # error and any sim noise. SLAM's map→odom does the real correction.
+        # ── odom integrator ─────────────────────────────────────────────
+        # Prefer pose deltas in Isaac mode because some sim_server builds keep
+        # base_twist at zero even while the base is moving. Large jumps are
+        # treated as resets/teleports and are not integrated.
         self._odom_x = 0.0
         self._odom_y = 0.0
         self._odom_yaw = 0.0
         self._prev_stamp_ns: Optional[int] = None
+        self._prev_world_pose: Optional[tuple[float, float, float]] = None
         self._sub_thread = threading.Thread(target=self._sub_loop, daemon=True)
         self._sub_thread.start()
 
@@ -323,15 +326,12 @@ class IsaacBridge(Node):
         clock.clock = stamp
         self._pub_clock.publish(clock)
 
-        # base_pose is read ONLY to extract the current world-yaw, used to
-        # rotate the world-frame `base_twist` into body frame (real wheel
-        # encoders give body-frame velocities directly; we recover that here).
-        # The pose itself is NOT used to set odom — that would leak ground
-        # truth and trivialize SLAM. We start /odom at (0,0,0) and integrate.
         pose = msg.get('base_pose') or [0.0] * 7
         twist = msg.get('base_twist') or [0.0] * 6
         if len(pose) < 7 or len(twist) < 6:
             return
+        px_w = float(pose[0])
+        py_w = float(pose[1])
         qx, qy, qz, qw = (float(v) for v in pose[3:7])
         vx_w = float(twist[0])
         vy_w = float(twist[1])
@@ -341,10 +341,6 @@ class IsaacBridge(Node):
         # ground robot — pitch/roll ignored).
         yaw_w = math.atan2(2.0 * (qw * qz + qx * qy),
                            1.0 - 2.0 * (qy * qy + qz * qz))
-        # Rotate world-frame velocity by -yaw_w → body frame.
-        cs_w, sn_w = math.cos(yaw_w), math.sin(yaw_w)
-        vx_b = vx_w * cs_w + vy_w * sn_w
-        vy_b = -vx_w * sn_w + vy_w * cs_w
 
         # Δt from previous proprio stamp; first frame has no integration step.
         if self._prev_stamp_ns is None:
@@ -352,6 +348,26 @@ class IsaacBridge(Node):
         else:
             dt = max(0.0, (stamp_ns - self._prev_stamp_ns) * 1e-9)
         self._prev_stamp_ns = stamp_ns
+
+        if self._odom_from_pose_delta and self._prev_world_pose is not None:
+            prev_x_w, prev_y_w, prev_yaw_w = self._prev_world_pose
+            dx_w = px_w - prev_x_w
+            dy_w = py_w - prev_y_w
+            dyaw_w = math.atan2(
+                math.sin(yaw_w - prev_yaw_w),
+                math.cos(yaw_w - prev_yaw_w))
+            # Ignore teleports/resets and stale frames; otherwise derive odom
+            # velocity from the measured pose delta.
+            if 1e-4 <= dt <= 1.0 and math.hypot(dx_w, dy_w) < 1.0 and abs(dyaw_w) < 1.5:
+                vx_w = dx_w / dt
+                vy_w = dy_w / dt
+                wz = dyaw_w / dt
+        self._prev_world_pose = (px_w, py_w, yaw_w)
+
+        # Rotate world-frame velocity by -yaw_w → body frame.
+        cs_w, sn_w = math.cos(yaw_w), math.sin(yaw_w)
+        vx_b = vx_w * cs_w + vy_w * sn_w
+        vy_b = -vx_w * sn_w + vy_w * cs_w
 
         # Integrate body-frame velocity through our drifty odom-yaw.
         cs_o, sn_o = math.cos(self._odom_yaw), math.sin(self._odom_yaw)
